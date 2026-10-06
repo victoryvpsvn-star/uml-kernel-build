@@ -52,6 +52,43 @@ func NewPool(start net.IP, size int) *Pool {
 	return p
 }
 
+// addrAt returns base+off as a full 32-bit address (carry across octets).
+// Adding to the last octet alone wraps .255 -> .0 of the SAME subnet,
+// handing out duplicate or foreign addresses once the pool runs past it.
+func addrAt(base [4]byte, off int) [4]byte {
+	v := binary.BigEndian.Uint32(base[:]) + uint32(off)
+	var out [4]byte
+	binary.BigEndian.PutUint32(out[:], v)
+	return out
+}
+
+// SizeForNetwork bounds a pool starting at start to the usable addresses
+// left inside network (start itself counts; the broadcast address is
+// excluded). Returns 0 when start is nil or outside the network — the
+// caller must then disable DHCP rather than lease unreachable addresses.
+func SizeForNetwork(network string, start net.IP, maxSize int) int {
+	ip4 := start.To4()
+	if ip4 == nil {
+		return 0
+	}
+	_, ipnet, err := net.ParseCIDR(network)
+	if err != nil {
+		return 0
+	}
+	first := binary.BigEndian.Uint32(ipnet.IP.To4())
+	mask := binary.BigEndian.Uint32(ipnet.Mask)
+	last := first | ^mask // broadcast address, not leasable
+	s := binary.BigEndian.Uint32(ip4)
+	if s < first || s >= last {
+		return 0
+	}
+	size := int(last - s) // addresses start..last-1
+	if size > maxSize {
+		size = maxSize
+	}
+	return size
+}
+
 // GetOrAssign returns the stable lease for a MAC, assigning the next free
 // address in the pool. Fully occupied pools return an error (the C binary
 // just ran out of its 20 BOOTP clients; same semantics, no surprises).
@@ -66,9 +103,7 @@ func (p *Pool) GetOrAssign(mac net.HardwareAddr) (net.IP, error) {
 	if p.next >= p.size {
 		return nil, fmt.Errorf("dhcp pool exhausted (%d leases)", p.size)
 	}
-	var ip [4]byte
-	copy(ip[:], p.base[:])
-	ip[3] += byte(p.next)
+	ip := addrAt(p.base, p.next)
 	p.next++
 	p.assigned[key] = ip
 	p.order = append(p.order, key)
@@ -83,9 +118,7 @@ func (p *Pool) Restore(leases map[[6]byte][4]byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for off := 0; off < p.size; off++ {
-		var ip [4]byte
-		copy(ip[:], p.base[:])
-		ip[3] += byte(off)
+		ip := addrAt(p.base, off)
 		for mac, a := range leases {
 			if a != ip {
 				continue
@@ -229,18 +262,32 @@ func (s *Server) HandlePacket(payload []byte, guestMAC [6]byte) []byte {
 	}
 	reply.UpdateOption(dhcpv4.OptMessageType(msgType))
 
-	return s.buildFrame(reply.ToBytes(), guestMAC)
+	// RFC 2131 §4.1: a client that clears the BROADCAST flag cannot
+	// receive broadcast replies — unicast to its hardware address at the
+	// offered yiaddr instead. Always-broadcast replies silently break
+	// those clients (several embedded and Windows stacks do this).
+	broadcast := m.IsBroadcast()
+	return s.buildFrame(reply.ToBytes(), guestMAC, ip, broadcast)
 }
 
 // buildFrame wraps a DHCP payload in Ethernet/IP/UDP from the server
-// address to the broadcast address (RFC 2131 replies go to :68).
-func (s *Server) buildFrame(payload []byte, dstMAC [6]byte) []byte {
+// address to the client — broadcast (MAC and IP) when the client set the
+// BROADCAST flag, unicast to its MAC and offered address otherwise.
+func (s *Server) buildFrame(payload []byte, dstMAC [6]byte, dstIP net.IP, broadcast bool) []byte {
 	const (
 		srcPort = 67
 		dstPort = 68
 	)
 	ip4 := tcpip.AddrFrom4(s.gatewayBytes())
-	bcast := tcpip.AddrFrom4([4]byte{255, 255, 255, 255})
+
+	dstAddr := tcpip.AddrFrom4([4]byte{255, 255, 255, 255})
+	ethDst := header.EthernetBroadcastAddress
+	if !broadcast {
+		if d4 := dstIP.To4(); d4 != nil {
+			dstAddr = tcpip.AddrFrom4([4]byte{d4[0], d4[1], d4[2], d4[3]})
+			ethDst = tcpip.LinkAddress(dstMAC[:])
+		}
+	}
 
 	udpLen := header.UDPMinimumSize + len(payload)
 	udp := header.UDP(make([]byte, udpLen))
@@ -250,7 +297,7 @@ func (s *Server) buildFrame(payload []byte, dstMAC [6]byte) []byte {
 		Length:  uint16(udpLen),
 	})
 	copy(udp.Payload(), payload)
-	pseudo := header.PseudoHeaderChecksum(header.UDPProtocolNumber, ip4, bcast, uint16(udpLen))
+	pseudo := header.PseudoHeaderChecksum(header.UDPProtocolNumber, ip4, dstAddr, uint16(udpLen))
 	withPayload := checksum.Combine(pseudo, checksum.Checksum(payload, 0))
 	udp.SetChecksum(^udp.CalculateChecksum(withPayload))
 
@@ -261,7 +308,7 @@ func (s *Server) buildFrame(payload []byte, dstMAC [6]byte) []byte {
 		TTL:         64,
 		Protocol:    uint8(header.UDPProtocolNumber),
 		SrcAddr:     ip4,
-		DstAddr:     bcast,
+		DstAddr:     dstAddr,
 	})
 	copy(ip[header.IPv4MinimumSize:], udp)
 	ip.SetChecksum(^ip.CalculateChecksum())
@@ -270,7 +317,7 @@ func (s *Server) buildFrame(payload []byte, dstMAC [6]byte) []byte {
 	eth := header.Ethernet(frame)
 	eth.Encode(&header.EthernetFields{
 		SrcAddr: s.mac,
-		DstAddr: header.EthernetBroadcastAddress,
+		DstAddr: ethDst,
 		Type:    0x0800,
 	})
 	copy(frame[header.EthernetMinimumSize:], ip)

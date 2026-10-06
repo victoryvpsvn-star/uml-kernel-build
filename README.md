@@ -13,7 +13,9 @@ User-Mode Linux, batteries included:
   hub failover with lease inheritance, and a WebSocket bridge for
   peers across the internet.
 - **Launcher** — [`launcher/boot`](launcher/boot) wraps kernel +
-  engine + cloud image into one command.
+  engine + cloud image into one command; on Windows,
+  [`launcher/boot.ps1`](launcher/boot.ps1) drives the same stack
+  through WSL2.
 
 ## Quick start
 
@@ -23,6 +25,16 @@ cd dir-with-linux-and-base.img
 ./boot            # boots with 2G RAM; root/root login
 ./boot 4G 2       # custom memory and vCPUs
 ```
+
+On Windows the same files boot through WSL2:
+
+```powershell
+cd C:\uml
+.\boot.ps1          # or: .\boot.ps1 4G 2
+```
+
+See [`docs/windows.md`](docs/windows.md) for setup, port forwarding and
+WSL2-specific notes.
 
 The launcher reads `config.yaml` (copy
 [`launcher/config.example.yaml`](launcher/config.example.yaml)) to pick
@@ -34,12 +46,12 @@ default — no network setup inside.
 | Path | What |
 |---|---|
 | `vdeplug-go/` | The Go network helper (default engine) — [its README](vdeplug-go/README.md) |
-| `launcher/` | `boot` script + commented `config.example.yaml` |
+| `launcher/` | `boot` + `boot.ps1` (Windows/WSL2) + commented `config.example.yaml` |
 | `legacy/` | The generation-1 standalone `slirp` helper (kept building) |
 | `vde_plug/` | The C generation-2 helper (standalone build) |
 | `patches/` | Kernel patches + config fragments merged by every build |
 | `rootfs/nocloud/` | NoCloud seed baked into base images (DHCP by default) |
-| `docs/` | [Distributed setup](docs/distributed.md) · [Technical changelogs](docs/technical_changelogs.md) |
+| `docs/` | [Windows (WSL2)](docs/windows.md) · [Distributed setup](docs/distributed.md) · [Technical changelogs](docs/technical_changelogs.md) |
 | `.github/workflows/` | Kernel matrix, base images, helper builds, releases |
 
 ## Docs

@@ -44,7 +44,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
-func logf(f string, a ...any)  { fmt.Fprintf(os.Stderr, "[vde_plug-go] "+f+"\n", a...) }
+func logf(f string, a ...any) { fmt.Fprintf(os.Stderr, "[vde_plug-go] "+f+"\n", a...) }
 func fatalf(f string, a ...any) {
 	fmt.Fprintf(os.Stderr, "[vde_plug-go] fatal: "+f+"\n", a...)
 	os.Exit(1)
@@ -75,7 +75,13 @@ func main() {
 		logf("uplink %q", cfg.Uplink)
 	}
 
-	ep := link.New(fd, link.FrameMax-18, vdeMAC)
+	// cfg.mtu narrows the link MTU netstack advertises/uses; unset or
+	// out-of-range keeps the full frame size.
+	mtu := uint32(link.FrameMax - 18)
+	if cfg.MTU >= 68 && cfg.MTU <= link.FrameMax-18 {
+		mtu = uint32(cfg.MTU)
+	}
+	ep := link.New(fd, mtu, vdeMAC)
 	sw := vswitch.New()
 
 	sockPath := resolveSwitchSocket(cfg, filepath.Dir(self))
@@ -200,23 +206,30 @@ func (f *fleet) runInstance(ln transport.Listener, release func()) {
 		// DHCP at the frame layer (netstack sheds limited-broadcast
 		// DISCOVERs before the transport demuxer would see them). A
 		// promoted hub seeds the pool with the lease table the dead hub
-		// gossiped, so guests keep their addresses.
+		// gossiped, so guests keep their addresses. The pool is capped at
+		// the usable addresses left in the network — leasing past the
+		// subnet edge hands guests unreachable addresses.
 		if start := net.ParseIP(cfg.DHCPStart); start != nil && cfg.DHCPStart != "" {
-			leasePool = dhcp.NewPool(start, 256)
-			f.mu.Lock()
-			seed := f.leases
-			f.leases = nil
-			f.mu.Unlock()
-			if len(seed) > 0 {
-				leasePool.Restore(seed)
-				logf("%s: promoted to hub, %d leases inherited", descr, len(seed))
+			size := dhcp.SizeForNetwork(cfg.Network, start, 256)
+			if size <= 0 {
+				logf("dhcp_start %s outside %s; DHCP disabled", cfg.DHCPStart, cfg.Network)
+			} else {
+				leasePool = dhcp.NewPool(start, size)
+				f.mu.Lock()
+				seed := f.leases
+				f.leases = nil
+				f.mu.Unlock()
+				if len(seed) > 0 {
+					leasePool.Restore(seed)
+					logf("%s: promoted to hub, %d leases inherited", descr, len(seed))
+				}
+				dhcpSrv = dhcp.New(dhcp.Options{
+					Network:    cfg.Network,
+					GatewayIP:  cfg.Gateway,
+					Nameserver: cfg.Nameserver,
+					MTU:        cfg.MTU,
+				}, leasePool, vdeMAC)
 			}
-			dhcpSrv = dhcp.New(dhcp.Options{
-				Network:    cfg.Network,
-				GatewayIP:  cfg.Gateway,
-				Nameserver: cfg.Nameserver,
-				MTU:        cfg.MTU,
-			}, leasePool, vdeMAC)
 		}
 
 		upl = uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw, own: ownAddrs(cfg)}
@@ -550,7 +563,8 @@ func peerReader(sw *vswitch.Switch, port vswitch.Port, conn transport.Conn) {
 	}
 }
 
-func waitShutdown(theNAT *nat.NAT, sw *vswitch.Switch, leasePool *dhcp.Pool, rxErr <-chan error, txErr <-chan error) {	sigs := make(chan os.Signal, 2)
+func waitShutdown(theNAT *nat.NAT, sw *vswitch.Switch, leasePool *dhcp.Pool, rxErr <-chan error, txErr <-chan error) {
+	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
 loop:
 	for {
@@ -673,10 +687,14 @@ func dumpStats(n *nat.NAT, sw *vswitch.Switch, pool *dhcp.Pool) {
 }
 
 func parseArgs(argv []string) (descr string, fd int, vnl string) {
+	fd = -1 // a missing/garbled seqpacket:// must fail the fd<0 check,
+	// never fall through to fd 0 (stdin)
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
 		if rest, ok := strings.CutPrefix(arg, "seqpacket://"); ok {
-			fd, _ = strconv.Atoi(rest)
+			if n, err := strconv.Atoi(rest); err == nil {
+				fd = n
+			}
 			continue
 		}
 		if rest, ok := strings.CutPrefix(arg, "--descr"); ok {

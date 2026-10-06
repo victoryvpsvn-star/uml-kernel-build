@@ -26,13 +26,21 @@ import (
 )
 
 // Start launches one host listener per rule (TCP listeners + UDP relays).
-// It returns immediately; services run until the process exits.
+// It returns immediately; services run until the process exits. On error
+// every listener already opened is closed — no half-started forwards.
 func Start(s *stack.Stack, cfg *config.Config, fallbackIP net.IP) (*Server, error) {
 	rules, err := cfg.ParsePorts()
 	if err != nil {
 		return nil, fmt.Errorf("ports: %w", err)
 	}
 	srv := &Server{}
+	var cleanup []io.Closer
+	fail := func(err error) (*Server, error) {
+		for _, c := range cleanup {
+			c.Close()
+		}
+		return nil, err
+	}
 	for _, r := range rules {
 		guestIP := r.GuestIP
 		if guestIP == "" {
@@ -41,27 +49,40 @@ func Start(s *stack.Stack, cfg *config.Config, fallbackIP net.IP) (*Server, erro
 		if r.LastOctet > 0 {
 			ip4 := fallbackIP.To4()
 			if ip4 == nil {
-				return nil, fmt.Errorf("ports: fallback %s not IPv4", fallbackIP)
+				return fail(fmt.Errorf("ports: fallback %s not IPv4", fallbackIP))
 			}
 			ip := make(net.IP, 4)
 			copy(ip, ip4)
 			ip[3] = byte(r.LastOctet)
 			guestIP = ip.String()
 		}
+		if net.ParseIP(guestIP).To4() == nil {
+			// A nil fallback renders as "<nil>" and would panic the
+			// indexer below; reject the rule with a readable error.
+			return fail(fmt.Errorf("ports: bad guest address %q (check dhcp_start/network)", guestIP))
+		}
 		hostAddr := net.JoinHostPort(r.HostIP, strconv.Itoa(int(r.HostPort)))
 		if r.UDP {
 			udpAddr, err := net.ResolveUDPAddr("udp", hostAddr)
 			if err != nil {
-				return nil, fmt.Errorf("listen %s: %w", hostAddr, err)
+				return fail(fmt.Errorf("listen %s: %w", hostAddr, err))
 			}
+			uc, err := net.ListenUDP("udp", udpAddr)
+			if err != nil {
+				// Bind in Start so a port clash surfaces immediately
+				// instead of dying silently inside the relay goroutine.
+				return fail(fmt.Errorf("listen %s: %w", hostAddr, err))
+			}
+			cleanup = append(cleanup, uc)
 			srv.wg.Add(1)
-			go srv.serveUDP(s, udpAddr, guestIP, r.GuestPort)
+			go srv.serveUDP(s, uc, guestIP, r.GuestPort)
 			continue
 		}
 		ln, err := net.Listen("tcp", hostAddr)
 		if err != nil {
-			return nil, fmt.Errorf("listen %s: %w", hostAddr, err)
+			return fail(fmt.Errorf("listen %s: %w", hostAddr, err))
 		}
+		cleanup = append(cleanup, ln)
 		srv.wg.Add(1)
 		go srv.serveTCP(s, ln, guestIP, r.GuestPort)
 	}
@@ -110,12 +131,9 @@ func pipe(a, b net.Conn) {
 // serveUDP relays host datagrams into the guest. Each remote host sender
 // gets its own netstack socket so guest replies return to the right peer;
 // idle paths die after udpIdle.
-func (s *Server) serveUDP(sck *stack.Stack, hostAddr *net.UDPAddr, guestIP string, guestPort uint16) {
+func (s *Server) serveUDP(sck *stack.Stack, host *net.UDPConn, guestIP string, guestPort uint16) {
 	defer s.wg.Done()
-	host, err := net.ListenUDP("udp", hostAddr)
-	if err != nil {
-		return
-	}
+	defer host.Close()
 	guest4 := net.ParseIP(guestIP).To4()
 	dst := tcpip.FullAddress{
 		Addr: tcpip.AddrFrom4([4]byte{guest4[0], guest4[1], guest4[2], guest4[3]}),
@@ -128,11 +146,17 @@ func (s *Server) serveUDP(sck *stack.Stack, hostAddr *net.UDPAddr, guestIP strin
 	}
 	var mu sync.Mutex
 	var paths []*path
+	done := make(chan struct{})
+	defer close(done) // stops the reaper when the host socket dies
 
 	// Reaper for idle paths.
 	go func() {
 		for {
-			time.Sleep(time.Minute)
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Minute):
+			}
 			mu.Lock()
 			keep := paths[:0]
 			for _, p := range paths {

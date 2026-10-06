@@ -19,7 +19,9 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -154,13 +156,12 @@ func main() {
 		wsURL := *url
 		if *token != "" {
 			sep := "?"
-			for i := 0; i < len(wsURL); i++ {
-				if wsURL[i] == '?' {
-					sep = "&"
-					break
-				}
+			if strings.Contains(wsURL, "?") {
+				sep = "&"
 			}
-			wsURL += sep + "token=" + *token
+			// Escape: tokens with &, =, space or # would otherwise
+			// corrupt the query string or truncate the credential.
+			wsURL += sep + "token=" + neturl.QueryEscape(*token)
 		}
 		// A helper that declares our socket file stale unlinks it; when
 		// the path no longer resolves to our listener's inode, rebind a

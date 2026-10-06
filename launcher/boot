@@ -83,9 +83,14 @@ else
     fi
 fi
 
+# Track the fallback tmpdir we created: it is made whenever /dev/shm is
+# unusable (regardless of SKAS_MODE, which only exists for UP kernels),
+# so the cleanup must key on SHM_OK, not on SKAS_MODE.
+TMP_FALLBACK=0
 if [ "$SHM_OK" -eq 0 ]; then
     mkdir -p "$BASE/.uml_tmp"
     export TMP="$BASE/.uml_tmp" TMPDIR="$BASE/.uml_tmp" TEMP="$BASE/.uml_tmp"
+    TMP_FALLBACK=1
 fi
 
 export PATH="$BASE:$PATH"
@@ -109,10 +114,12 @@ echo "  Login: root / root"
 echo "========================================"
 echo ""
 
-cleanup() { if [ -n "$SKAS_MODE" ]; then rm -rf "$BASE/.uml_tmp" 2>/dev/null; fi; }
+cleanup() { if [ "$TMP_FALLBACK" -eq 1 ]; then rm -rf "$BASE/.uml_tmp" 2>/dev/null; fi; }
 trap cleanup EXIT
 
-exec "$KERNEL" \
+# No exec here: exec replaces the shell, the EXIT trap above would never
+# fire and the fallback tmpdir would leak on every boot.
+"$KERNEL" \
     mem="$MEMORY" \
     $SKAS_MODE \
     $SMP_ARGS \
